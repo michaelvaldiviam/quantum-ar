@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Quantum Overlay AR</title>
+  <style>
+    html, body { margin:0; height:100%; background:#0b0b0f; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { position:relative; width:100vw; height:100vh; overflow:hidden; }
+    #cam {
+      position:absolute; inset:0;
+      width:100%; height:100%;
+      object-fit:cover;
+      transform: scaleX(-1); /* “selfie feel”; quita si usas environment */
+      background:#000;
+    }
+    #overlay { position:absolute; inset:0; pointer-events:none; }
+    .w {
+      position:absolute;
+      width:78px; height:78px;
+      border-radius:999px;
+      display:flex; align-items:center; justify-content:center;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.30);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      font-size: 34px;
+      user-select:none;
+      pointer-events:auto; /* para poder “medir” tocando */
+    }
+    #hud {
+      position:absolute; left:12px; right:12px; top:12px;
+      padding:10px 12px;
+      border-radius:12px;
+      background: rgba(0,0,0,0.55);
+      color:#d7f9ff;
+      font-size: 13px;
+      line-height: 1.25rem;
+      z-index:20;
+    }
+    #controls {
+      position:absolute; left:0; right:0; bottom:18px;
+      display:flex; justify-content:center; gap:10px;
+      z-index:30;
+    }
+    button {
+      padding: 10px 14px;
+      border:0;
+      border-radius:999px;
+      background:#ffffff;
+      font-weight: 700;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.35);
+    }
+    #dbg {
+      position:absolute; left:12px; right:12px; bottom:72px;
+      padding:8px 10px;
+      border-radius:12px;
+      background: rgba(0,0,0,0.55);
+      color:#9effa6;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+      max-height: 30vh;
+      overflow:auto;
+      z-index:25;
+      display:none;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <video id="cam" autoplay playsinline muted></video>
+    <div id="overlay"></div>
+
+    <div id="hud">
+      Estado: <span id="status">Listo</span><br/>
+      Qubit seleccionado: <span id="qinfo">Ninguno</span>
+    </div>
+
+    <div id="dbg"></div>
+
+    <div id="controls">
+      <button id="startBtn">Activar cámara</button>
+      <button id="respBtn">Re-superponer</button>
+      <button id="dbgBtn">Debug</button>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status");
+  const qinfoEl  = $("qinfo");
+  const dbgEl    = $("dbg");
+  const overlay  = $("overlay");
+  const video    = $("cam");
+
+  const log = (m) => { dbgEl.innerHTML += `${m}<br/>`; dbgEl.scrollTop = dbgEl.scrollHeight; };
+
+  // --- “Qubit” mínimo (simulador real-valued para UX, no para física experimental) ---
+  // Estado: |ψ> = a|0> + b|1>, con a,b reales y a^2+b^2=1
+  const Q = {
+    norm(a,b){ const n = Math.hypot(a,b) || 1; return [a/n, b/n]; },
+    hadamard(a,b){
+      const s = Math.SQRT1_2; // 1/sqrt(2)
+      return this.norm((a+b)*s, (a-b)*s);
+    },
+    rot(a,b,theta){
+      // Rotación en el plano (equivalente a “mezclar” amplitudes)
+      const c = Math.cos(theta), s = Math.sin(theta);
+      return this.norm(a*c - b*s, a*s + b*c);
+    },
+    probs(a,b){ return {p0: a*a, p1: b*b}; },
+    measure(a,b){
+      const {p0} = this.probs(a,b);
+      return (Math.random() < p0) ? [1,0] : [0,1];
+    }
+  };
+
+  // --- Campo “materia/obstáculos” desde luminancia (como tu idea actual pero simplificado) ---
+  const gridW = 72, gridH = 72;
+  const buf = document.createElement("canvas");
+  buf.width = gridW; buf.height = gridH;
+  const bctx = buf.getContext("2d", { willReadFrequently:true });
+  const obstacle = new Uint8Array(gridW * gridH);
+
+  function scanObstacles(){
+    if (video.readyState < 2) return;
+    bctx.drawImage(video, 0, 0, gridW, gridH);
+    const frame = bctx.getImageData(0,0,gridW,gridH).data;
+    const thr = 55;
+    for (let i=0, j=0; i<frame.length; i+=4, j++){
+      const lum = (frame[i] + frame[i+1] + frame[i+2]) / 3;
+      obstacle[j] = (lum < thr) ? 1 : 0;
+    }
+  }
+
+  function obstacleForce(px, py){
+    // px,py en coords pantalla; devuelve vector repulsivo
+    const sx = window.innerWidth  / gridW;
+    const sy = window.innerHeight / gridH;
+    const gx = Math.max(0, Math.min(gridW-1, Math.floor(px / sx)));
+    const gy = Math.max(0, Math.min(gridH-1, Math.floor(py / sy)));
+
+    let fx = 0, fy = 0;
+    const r = 5;
+    for (let y=-r; y<=r; y++){
+      for (let x=-r; x<=r; x++){
+        const cx = gx + x, cy = gy + y;
+        if (cx<0 || cx>=gridW || cy<0 || cy>=gridH) continue;
+        if (obstacle[cy*gridW + cx] !== 1) continue;
+        const d2 = x*x + y*y;
+        if (d2 === 0 || d2 > r*r) continue;
+        const k = 18 / d2;
+        fx += (-x) * k;
+        fy += (-y) * k;
+      }
+    }
+    return [fx, fy];
+  }
+
+  // --- Widgets AR con dinámica controlada por superposición ---
+  const icons = ["🧊","🧬","🧿","⚛️","💧","🪐"];
+  const widgets = [];
+  let selected = null;
+
+  function makeWidgets(){
+    overlay.innerHTML = "";
+    widgets.length = 0;
+    const cx = window.innerWidth/2, cy = window.innerHeight/2;
+
+    icons.forEach((ic, i) => {
+      const el = document.createElement("div");
+      el.className = "w";
+      el.textContent = ic;
+      overlay.appendChild(el);
+
+      // qubit inicial en superposición (H|0>)
+      let [a,b] = Q.hadamard(1,0);
+
+      const w = {
+        el,
+        x: cx + (Math.random()-0.5)*180,
+        y: cy + (Math.random()-0.5)*180,
+        vx: 0, vy: 0,
+        tx: cx + (Math.random()-0.5)*120,
+        ty: cy + (Math.random()-0.5)*120,
+        a, b
+      };
+
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        selected = w;
+
+        // “Medición”: colapsa el qubit del widget y cambia su comportamiento
+        [w.a, w.b] = Q.measure(w.a, w.b);
+        const {p0,p1} = Q.probs(w.a,w.b);
+        qinfoEl.textContent = `${ic}  p(|0>)=${p0.toFixed(2)}  p(|1>)=${p1.toFixed(2)}  (colapsado)`;
+      });
+
+      widgets.push(w);
+    });
+
+    document.body.addEventListener("click", () => { selected = null; qinfoEl.textContent = "Ninguno"; });
+  }
+
+  function resuperposeAll(){
+    widgets.forEach(w => ([w.a, w.b] = Q.hadamard(1,0)));
+    qinfoEl.textContent = "Ninguno";
+  }
+
+  function step(){
+    scanObstacles();
+
+    const cx = window.innerWidth/2, cy = window.innerHeight/2;
+
+    for (const w of widgets){
+      // Puerta cuántica suave: el “entorno” rota el estado (decoherencia/ruido controlado)
+      // (más rotación si está cerca de obstáculos)
+      const [ofx, ofy] = obstacleForce(w.x, w.y);
+      const env = Math.min(1, Math.hypot(ofx, ofy) / 120);
+      [w.a, w.b] = Q.rot(w.a, w.b, 0.02 + 0.06*env);
+
+      const {p0, p1} = Q.probs(w.a, w.b);
+
+      // Dos “trayectorias” clásicas simultáneas:
+      // |0>: atracción al objetivo (orden)
+      // |1>: repulsión a obstáculos + deriva (flujo)
+      const ax = (w.tx - w.x) * 0.018 + (cx - w.x) * 0.002;
+      const ay = (w.ty - w.y) * 0.018 + (cy - w.y) * 0.002;
+
+      const rx = ofx * 0.9 + (Math.random()-0.5)*1.0;
+      const ry = ofy * 0.9 + (Math.random()-0.5)*1.0;
+
+      // Superposición => mezcla ponderada por probabilidades
+      w.vx += p0*ax + p1*rx;
+      w.vy += p0*ay + p1*ry;
+
+      // Colisión suave entre widgets
+      for (const o of widgets){
+        if (o === w) continue;
+        const dx = w.x - o.x, dy = w.y - o.y;
+        const d = Math.hypot(dx,dy);
+        if (d > 0 && d < 82){
+          const push = (82 - d) * 0.04;
+          w.vx += (dx/d) * push;
+          w.vy += (dy/d) * push;
+        }
+      }
+
+      // Integración
+      w.vx *= 0.90; w.vy *= 0.90;
+      w.x += w.vx;  w.y += w.vy;
+
+      // Bordes
+      w.x = Math.max(40, Math.min(window.innerWidth - 40, w.x));
+      w.y = Math.max(40, Math.min(window.innerHeight - 40, w.y));
+
+      // Render
+      w.el.style.transform = `translate(${(w.x-39).toFixed(1)}px, ${(w.y-39).toFixed(1)}px)`;
+
+      // HUD si está seleccionado
+      if (selected === w){
+        const {p0,p1} = Q.probs(w.a,w.b);
+        qinfoEl.textContent = `${w.el.textContent}  p(|0>)=${p0.toFixed(2)}  p(|1>)=${p1.toFixed(2)}  (en superposición)`;
+      }
+    }
+
+    requestAnimationFrame(step);
+  }
+
+  async function startCamera(){
+    if (!window.isSecureContext) {
+      statusEl.textContent = "Bloqueado: contexto no seguro (usa HTTPS o localhost).";
+      log("ERROR: window.isSecureContext=false");
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      statusEl.textContent = "Sin getUserMedia() en este contexto/navegador.";
+      log("ERROR: navigator.mediaDevices.getUserMedia no disponible");
+      return;
+    }
+
+    statusEl.textContent = "Solicitando permisos…";
+    try {
+      // Primero intenta “environment” (trasera). En algunos móviles el mirror no aplica.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      statusEl.textContent = "Cámara activa.";
+    } catch (e1) {
+      log("Falló environment; probando video:true => " + (e1?.message || e1));
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        video.srcObject = stream;
+        await video.play();
+        statusEl.textContent = "Cámara activa (fallback).";
+      } catch (e2) {
+        statusEl.textContent = "Error de permisos/cámara. Revisa permisos del sitio.";
+        log("ERROR FATAL: " + (e2?.message || e2));
+      }
+    }
+  }
+
+  // UI
+  $("startBtn").addEventListener("click", async () => { await startCamera(); });
+  $("respBtn").addEventListener("click", () => { resuperposeAll(); });
+  $("dbgBtn").addEventListener("click", () => {
+    dbgEl.style.display = (dbgEl.style.display === "block") ? "none" : "block";
+  });
+
+  // Init
+  makeWidgets();
+  step();
+
+  window.addEventListener("resize", () => { makeWidgets(); });
+})();
+</script>
+</body>
+</html>
