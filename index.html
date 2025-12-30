@@ -3,19 +3,21 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
-  <title>Quantum Overlay AR</title>
+  <title>Quantum Overlay AR (Multi-Qubit)</title>
   <style>
     html, body { margin:0; height:100%; background:#0b0b0f; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
     #app { position:relative; width:100vw; height:100vh; overflow:hidden; }
-    #cam {
+    #cam{
       position:absolute; inset:0;
       width:100%; height:100%;
       object-fit:cover;
-      transform: scaleX(-1); /* “selfie feel”; quita si usas environment */
+      transform:none;                 /* FIX: sin espejo por defecto (trasera) */
       background:#000;
     }
-    #overlay { position:absolute; inset:0; pointer-events:none; }
-    .w {
+    #cam.mirrored{ transform: scaleX(-1); }  /* espejo solo si frontal / manual */
+    #overlay{ position:absolute; inset:0; pointer-events:none; }
+
+    .w{
       position:absolute;
       width:78px; height:78px;
       border-radius:999px;
@@ -27,9 +29,11 @@
       -webkit-backdrop-filter: blur(10px);
       font-size: 34px;
       user-select:none;
-      pointer-events:auto; /* para poder “medir” tocando */
+      pointer-events:auto;
+      touch-action: manipulation;
     }
-    #hud {
+
+    #hud{
       position:absolute; left:12px; right:12px; top:12px;
       padding:10px 12px;
       border-radius:12px;
@@ -39,34 +43,37 @@
       line-height: 1.25rem;
       z-index:20;
     }
-    #controls {
+    #controls{
       position:absolute; left:0; right:0; bottom:18px;
       display:flex; justify-content:center; gap:10px;
-      z-index:30;
+      z-index:30; flex-wrap:wrap;
+      padding: 0 10px;
     }
-    button {
+    button{
       padding: 10px 14px;
       border:0;
       border-radius:999px;
       background:#ffffff;
-      font-weight: 700;
+      font-weight: 800;
       box-shadow: 0 10px 25px rgba(0,0,0,0.35);
     }
-    #dbg {
-      position:absolute; left:12px; right:12px; bottom:72px;
+    #dbg{
+      position:absolute; left:12px; right:12px; bottom:92px;
       padding:8px 10px;
       border-radius:12px;
       background: rgba(0,0,0,0.55);
       color:#9effa6;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12px;
-      max-height: 30vh;
+      max-height: 35vh;
       overflow:auto;
       z-index:25;
       display:none;
+      word-break: break-word;
     }
   </style>
 </head>
+
 <body>
   <div id="app">
     <video id="cam" autoplay playsinline muted></video>
@@ -74,14 +81,17 @@
 
     <div id="hud">
       Estado: <span id="status">Listo</span><br/>
-      Qubit seleccionado: <span id="qinfo">Ninguno</span>
+      Registro: <span id="reginfo">N=0</span><br/>
+      Selección: <span id="qinfo">Ninguna</span>
     </div>
 
     <div id="dbg"></div>
 
     <div id="controls">
       <button id="startBtn">Activar cámara</button>
-      <button id="respBtn">Re-superponer</button>
+      <button id="resetBtn">Reset cuántico</button>
+      <button id="entBtn">Entrelazar</button>
+      <button id="mirrorBtn">Espejo: Auto</button>
       <button id="dbgBtn">Debug</button>
     </div>
   </div>
@@ -90,6 +100,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const statusEl = $("status");
+  const regInfoEl = $("reginfo");
   const qinfoEl  = $("qinfo");
   const dbgEl    = $("dbg");
   const overlay  = $("overlay");
@@ -97,27 +108,61 @@
 
   const log = (m) => { dbgEl.innerHTML += `${m}<br/>`; dbgEl.scrollTop = dbgEl.scrollHeight; };
 
-  // --- “Qubit” mínimo (simulador real-valued para UX, no para física experimental) ---
-  // Estado: |ψ> = a|0> + b|1>, con a,b reales y a^2+b^2=1
-  const Q = {
-    norm(a,b){ const n = Math.hypot(a,b) || 1; return [a/n, b/n]; },
-    hadamard(a,b){
-      const s = Math.SQRT1_2; // 1/sqrt(2)
-      return this.norm((a+b)*s, (a-b)*s);
-    },
-    rot(a,b,theta){
-      // Rotación en el plano (equivalente a “mezclar” amplitudes)
-      const c = Math.cos(theta), s = Math.sin(theta);
-      return this.norm(a*c - b*s, a*s + b*c);
-    },
-    probs(a,b){ return {p0: a*a, p1: b*b}; },
-    measure(a,b){
-      const {p0} = this.probs(a,b);
-      return (Math.random() < p0) ? [1,0] : [0,1];
-    }
-  };
+  // ------------------------
+  // Cámara (espejo arreglado)
+  // ------------------------
+  let mirrorMode = "auto"; // "auto" | "on" | "off"
+  function setMirror(isFront){
+    if (mirrorMode === "on") video.classList.add("mirrored");
+    else if (mirrorMode === "off") video.classList.remove("mirrored");
+    else video.classList.toggle("mirrored", !!isFront);
+  }
+  function setMirrorFromStream(stream){
+    const track = stream?.getVideoTracks?.()[0];
+    const fm = track?.getSettings?.()?.facingMode; // "user" | "environment" (si disponible)
+    setMirror(fm === "user");
+  }
 
-  // --- Campo “materia/obstáculos” desde luminancia (como tu idea actual pero simplificado) ---
+  async function startCamera(){
+    if (!window.isSecureContext) {
+      statusEl.textContent = "Bloqueado: usa HTTPS o localhost.";
+      log("ERROR: window.isSecureContext=false");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      statusEl.textContent = "Sin getUserMedia() en este navegador/contexto.";
+      log("ERROR: navigator.mediaDevices.getUserMedia no disponible");
+      return;
+    }
+
+    statusEl.textContent = "Solicitando permisos…";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      setMirrorFromStream(stream);
+      await video.play();
+      statusEl.textContent = "Cámara activa.";
+    } catch (e1) {
+      log("Falló environment; probando video:true => " + (e1?.message || e1));
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        video.srcObject = stream;
+        setMirrorFromStream(stream);
+        await video.play();
+        statusEl.textContent = "Cámara activa (fallback).";
+      } catch (e2) {
+        statusEl.textContent = "Error de permisos/cámara. Revisa permisos del sitio.";
+        log("ERROR FATAL: " + (e2?.message || e2));
+      }
+    }
+  }
+
+  // ------------------------
+  // Visión simple (obstáculos)
+  // ------------------------
   const gridW = 72, gridH = 72;
   const buf = document.createElement("canvas");
   buf.width = gridW; buf.height = gridH;
@@ -136,7 +181,6 @@
   }
 
   function obstacleForce(px, py){
-    // px,py en coords pantalla; devuelve vector repulsivo
     const sx = window.innerWidth  / gridW;
     const sy = window.innerHeight / gridH;
     const gx = Math.max(0, Math.min(gridW-1, Math.floor(px / sx)));
@@ -159,15 +203,182 @@
     return [fx, fy];
   }
 
-  // --- Widgets AR con dinámica controlada por superposición ---
+  // ------------------------------------------
+  // Motor cuántico multi-qubit (statevector)
+  // ------------------------------------------
+  // Representación: arrays Float64 de re/im, longitud L = 2^N.
+  // Un qubit por widget. N=6 => L=64 (muy manejable).
+  const Quantum = (() => {
+    let N = 0, L = 0;
+    let re = new Float64Array(0);
+    let im = new Float64Array(0);
+
+    const SQRT1_2 = Math.SQRT1_2;
+
+    function alloc(n){
+      N = n;
+      L = 1 << N;
+      re = new Float64Array(L);
+      im = new Float64Array(L);
+      re[0] = 1; im[0] = 0;
+    }
+
+    function normalize(){
+      let s = 0;
+      for (let i=0;i<L;i++) s += re[i]*re[i] + im[i]*im[i];
+      const inv = 1 / Math.sqrt(s || 1);
+      for (let i=0;i<L;i++){ re[i]*=inv; im[i]*=inv; }
+    }
+
+    function applyH(q){
+      const step = 1 << (q+1);
+      const half = 1 << q;
+      for (let base=0; base<L; base+=step){
+        for (let j=0; j<half; j++){
+          const i0 = base + j;
+          const i1 = i0 + half;
+
+          const a0r = re[i0], a0i = im[i0];
+          const a1r = re[i1], a1i = im[i1];
+
+          // (a0 + a1)/sqrt2
+          re[i0] = (a0r + a1r) * SQRT1_2;
+          im[i0] = (a0i + a1i) * SQRT1_2;
+
+          // (a0 - a1)/sqrt2
+          re[i1] = (a0r - a1r) * SQRT1_2;
+          im[i1] = (a0i - a1i) * SQRT1_2;
+        }
+      }
+    }
+
+    function applyRz(q, theta){
+      // |0> *= e^{-iθ/2}, |1> *= e^{+iθ/2}
+      const c = Math.cos(theta/2);
+      const s = Math.sin(theta/2);
+      const step = 1 << (q+1);
+      const half = 1 << q;
+
+      // factor0 = c - i s ; factor1 = c + i s
+      for (let base=0; base<L; base+=step){
+        for (let j=0; j<half; j++){
+          const i0 = base + j;       // bit q = 0
+          const i1 = i0 + half;      // bit q = 1
+
+          // multiply (re + i im) by (c - i s)
+          {
+            const ar = re[i0], ai = im[i0];
+            re[i0] = ar*c + ai*s;
+            im[i0] = ai*c - ar*s;
+          }
+          // multiply by (c + i s)
+          {
+            const br = re[i1], bi = im[i1];
+            re[i1] = br*c - bi*s;
+            im[i1] = bi*c + br*s;
+          }
+        }
+      }
+    }
+
+    function applyCZ(q1, q2){
+      if (q1 === q2) return;
+      const b1 = 1 << q1;
+      const b2 = 1 << q2;
+      for (let i=0;i<L;i++){
+        if ((i & b1) && (i & b2)){
+          re[i] = -re[i];
+          im[i] = -im[i];
+        }
+      }
+    }
+
+    function measureZ(q){
+      // colapsa en base computacional del qubit q
+      const bit = 1 << q;
+      let p0 = 0, p1 = 0;
+      for (let i=0;i<L;i++){
+        const a2 = re[i]*re[i] + im[i]*im[i];
+        if (i & bit) p1 += a2; else p0 += a2;
+      }
+      const r = Math.random();
+      const outcome = (r < p0) ? 0 : 1;
+
+      const keep = outcome ? 1 : 0;
+      for (let i=0;i<L;i++){
+        const is1 = (i & bit) ? 1 : 0;
+        if (is1 !== keep){ re[i] = 0; im[i] = 0; }
+      }
+      normalize();
+      return { outcome, p0, p1 };
+    }
+
+    function measureX(q){
+      // medir en base X equivale a: H -> medir Z -> H
+      applyH(q);
+      const m = measureZ(q);
+      applyH(q);
+      return m;
+    }
+
+    function prob1X(q){
+      // Probabilidad de obtener |1> en base X sin modificar el estado:
+      // después de H, amplitud |1> = (a0 - a1)/sqrt2 para cada par.
+      const step = 1 << (q+1);
+      const half = 1 << q;
+      let p1 = 0;
+      for (let base=0; base<L; base+=step){
+        for (let j=0; j<half; j++){
+          const i0 = base + j;
+          const i1 = i0 + half;
+          const br = (re[i0] - re[i1]) * SQRT1_2;
+          const bi = (im[i0] - im[i1]) * SQRT1_2;
+          p1 += br*br + bi*bi;
+        }
+      }
+      return Math.min(1, Math.max(0, p1));
+    }
+
+    function resetToPlus(){
+      re.fill(0); im.fill(0);
+      re[0] = 1; im[0] = 0;
+      for (let q=0;q<N;q++) applyH(q); // |+>^N
+      normalize();
+    }
+
+    return {
+      alloc,
+      resetToPlus,
+      applyH,
+      applyRz,
+      applyCZ,
+      measureX,
+      prob1X,
+      get N(){ return N; },
+      get L(){ return L; },
+      getStateSnapshot(){
+        // útil para debug liviano
+        let s = 0;
+        for (let i=0;i<L;i++) s += re[i]*re[i] + im[i]*im[i];
+        return { norm: s };
+      }
+    };
+  })();
+
+  // ------------------------
+  // Widgets + dinámica
+  // ------------------------
   const icons = ["🧊","🧬","🧿","⚛️","💧","🪐"];
   const widgets = [];
   let selected = null;
+  let entangleOn = true;
 
   function makeWidgets(){
     overlay.innerHTML = "";
     widgets.length = 0;
-    const cx = window.innerWidth/2, cy = window.innerHeight/2;
+
+    const cx = window.innerWidth/2;
+    const cy = window.innerHeight/2;
 
     icons.forEach((ic, i) => {
       const el = document.createElement("div");
@@ -175,64 +386,111 @@
       el.textContent = ic;
       overlay.appendChild(el);
 
-      // qubit inicial en superposición (H|0>)
-      let [a,b] = Q.hadamard(1,0);
-
       const w = {
-        el,
+        el, icon: ic, qIndex: i,
         x: cx + (Math.random()-0.5)*180,
         y: cy + (Math.random()-0.5)*180,
         vx: 0, vy: 0,
-        tx: cx + (Math.random()-0.5)*120,
-        ty: cy + (Math.random()-0.5)*120,
-        a, b
+        tx: cx + (Math.random()-0.5)*140,
+        ty: cy + (Math.random()-0.5)*140,
+        p1x: 0.5,
+        env: 0
       };
 
       el.addEventListener("click", (ev) => {
         ev.stopPropagation();
         selected = w;
 
-        // “Medición”: colapsa el qubit del widget y cambia su comportamiento
-        [w.a, w.b] = Q.measure(w.a, w.b);
-        const {p0,p1} = Q.probs(w.a,w.b);
-        qinfoEl.textContent = `${ic}  p(|0>)=${p0.toFixed(2)}  p(|1>)=${p1.toFixed(2)}  (colapsado)`;
+        // Medición real (simulada) en base X sobre el qubit del widget
+        const m = Quantum.measureX(w.qIndex);
+        qinfoEl.textContent = `${w.icon}  q${w.qIndex}  X→ ${m.outcome}  (p0=${m.p0.toFixed(2)} p1=${m.p1.toFixed(2)})`;
       });
 
       widgets.push(w);
     });
 
-    document.body.addEventListener("click", () => { selected = null; qinfoEl.textContent = "Ninguno"; });
+    document.body.addEventListener("click", () => {
+      selected = null;
+      qinfoEl.textContent = "Ninguna";
+    }, { passive:true });
   }
 
-  function resuperposeAll(){
-    widgets.forEach(w => ([w.a, w.b] = Q.hadamard(1,0)));
-    qinfoEl.textContent = "Ninguno";
+  function resetQuantum(){
+    Quantum.alloc(icons.length);
+    Quantum.resetToPlus();
+    regInfoEl.textContent = `N=${Quantum.N} (L=${Quantum.L})`;
+    qinfoEl.textContent = "Ninguna";
   }
 
-  function step(){
+  // “espectáculo”: correlaciones globales (entrelazamiento en anillo)
+  function entangleRing(){
+    if (!entangleOn) return;
+    const N = Quantum.N;
+    for (let i=0;i<N;i++){
+      const j = (i+1) % N;
+      Quantum.applyCZ(i, j);
+    }
+  }
+
+  // loop: separamos update cuántico de frame para cuidar rendimiento
+  let lastT = performance.now();
+  let qAcc = 0;
+  const qDt = 1/30; // 30 Hz cuántico; física sigue a RAF
+
+  function step(tNow){
+    const dt = Math.min(0.05, (tNow - lastT) / 1000);
+    lastT = tNow;
+    qAcc += dt;
+
     scanObstacles();
 
     const cx = window.innerWidth/2, cy = window.innerHeight/2;
 
+    // 1) calcular env por widget (magnitud fuerza de obstáculos)
     for (const w of widgets){
-      // Puerta cuántica suave: el “entorno” rota el estado (decoherencia/ruido controlado)
-      // (más rotación si está cerca de obstáculos)
       const [ofx, ofy] = obstacleForce(w.x, w.y);
-      const env = Math.min(1, Math.hypot(ofx, ofy) / 120);
-      [w.a, w.b] = Q.rot(w.a, w.b, 0.02 + 0.06*env);
+      const env = Math.min(1, Math.hypot(ofx, ofy) / 140);
+      w.env = env;
+    }
 
-      const {p0, p1} = Q.probs(w.a, w.b);
+    // 2) evolución cuántica a ritmo fijo
+    while (qAcc >= qDt){
+      qAcc -= qDt;
 
-      // Dos “trayectorias” clásicas simultáneas:
-      // |0>: atracción al objetivo (orden)
-      // |1>: repulsión a obstáculos + deriva (flujo)
-      const ax = (w.tx - w.x) * 0.018 + (cx - w.x) * 0.002;
-      const ay = (w.ty - w.y) * 0.018 + (cy - w.y) * 0.002;
+      // Fase por entorno (cada qubit recibe Rz distinto)
+      for (const w of widgets){
+        const theta = 0.08 + 1.40 * w.env;  // más entorno => más fase => más interferencia
+        Quantum.applyRz(w.qIndex, theta);
+      }
 
-      const rx = ofx * 0.9 + (Math.random()-0.5)*1.0;
-      const ry = ofy * 0.9 + (Math.random()-0.5)*1.0;
+      // Entrelazamiento + un toque de “mezcla” (Hadamard parcial) para que se note
+      entangleRing();
 
-      // Superposición => mezcla ponderada por probabilidades
+      // Opcional: pequeña difusión cuántica global
+      for (let q=0;q<Quantum.N;q++){
+        if (Math.random() < 0.15) Quantum.applyH(q);
+      }
+
+      // Probabilidades en base X (interferencia) por qubit/widget
+      for (const w of widgets){
+        w.p1x = Quantum.prob1X(w.qIndex);
+      }
+    }
+
+    // 3) física clásica guiada por probabilidades cuánticas
+    for (const w of widgets){
+      const [ofx, ofy] = obstacleForce(w.x, w.y);
+      const p1 = w.p1x;
+      const p0 = 1 - p1;
+
+      // Modo |0> (orden): atracción a objetivo + leve centrado
+      const ax = (w.tx - w.x) * 0.020 + (cx - w.x) * 0.002;
+      const ay = (w.ty - w.y) * 0.020 + (cy - w.y) * 0.002;
+
+      // Modo |1> (exploración): repulsión a obstáculos + deriva suave
+      const rx = ofx * 0.95 + (Math.random()-0.5) * 1.2;
+      const ry = ofy * 0.95 + (Math.random()-0.5) * 1.2;
+
       w.vx += p0*ax + p1*rx;
       w.vy += p0*ay + p1*ry;
 
@@ -242,82 +500,68 @@
         const dx = w.x - o.x, dy = w.y - o.y;
         const d = Math.hypot(dx,dy);
         if (d > 0 && d < 82){
-          const push = (82 - d) * 0.04;
+          const push = (82 - d) * 0.045;
           w.vx += (dx/d) * push;
           w.vy += (dy/d) * push;
         }
       }
 
       // Integración
-      w.vx *= 0.90; w.vy *= 0.90;
-      w.x += w.vx;  w.y += w.vy;
+      w.vx *= 0.90;
+      w.vy *= 0.90;
+      w.x += w.vx;
+      w.y += w.vy;
 
       // Bordes
       w.x = Math.max(40, Math.min(window.innerWidth - 40, w.x));
       w.y = Math.max(40, Math.min(window.innerHeight - 40, w.y));
 
-      // Render
       w.el.style.transform = `translate(${(w.x-39).toFixed(1)}px, ${(w.y-39).toFixed(1)}px)`;
 
-      // HUD si está seleccionado
       if (selected === w){
-        const {p0,p1} = Q.probs(w.a,w.b);
-        qinfoEl.textContent = `${w.el.textContent}  p(|0>)=${p0.toFixed(2)}  p(|1>)=${p1.toFixed(2)}  (en superposición)`;
+        qinfoEl.textContent = `${w.icon}  q${w.qIndex}  pX(|1>)=${w.p1x.toFixed(2)}  env=${w.env.toFixed(2)}`;
       }
     }
 
     requestAnimationFrame(step);
   }
 
-  async function startCamera(){
-    if (!window.isSecureContext) {
-      statusEl.textContent = "Bloqueado: contexto no seguro (usa HTTPS o localhost).";
-      log("ERROR: window.isSecureContext=false");
-      return;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      statusEl.textContent = "Sin getUserMedia() en este contexto/navegador.";
-      log("ERROR: navigator.mediaDevices.getUserMedia no disponible");
-      return;
-    }
-
-    statusEl.textContent = "Solicitando permisos…";
-    try {
-      // Primero intenta “environment” (trasera). En algunos móviles el mirror no aplica.
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
-        audio: false
-      });
-      video.srcObject = stream;
-      await video.play();
-      statusEl.textContent = "Cámara activa.";
-    } catch (e1) {
-      log("Falló environment; probando video:true => " + (e1?.message || e1));
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        video.srcObject = stream;
-        await video.play();
-        statusEl.textContent = "Cámara activa (fallback).";
-      } catch (e2) {
-        statusEl.textContent = "Error de permisos/cámara. Revisa permisos del sitio.";
-        log("ERROR FATAL: " + (e2?.message || e2));
-      }
-    }
-  }
-
+  // ------------------------
   // UI
+  // ------------------------
   $("startBtn").addEventListener("click", async () => { await startCamera(); });
-  $("respBtn").addEventListener("click", () => { resuperposeAll(); });
-  $("dbgBtn").addEventListener("click", () => {
-    dbgEl.style.display = (dbgEl.style.display === "block") ? "none" : "block";
+  $("resetBtn").addEventListener("click", () => { resetQuantum(); });
+  $("entBtn").addEventListener("click", () => {
+    entangleOn = !entangleOn;
+    $("entBtn").textContent = entangleOn ? "Entrelazar" : "Entrelazar (off)";
   });
 
-  // Init
-  makeWidgets();
-  step();
+  $("mirrorBtn").addEventListener("click", () => {
+    mirrorMode = (mirrorMode === "auto") ? "off" : (mirrorMode === "off") ? "on" : "auto";
+    $("mirrorBtn").textContent = `Espejo: ${mirrorMode === "auto" ? "Auto" : (mirrorMode === "on" ? "On" : "Off")}`;
+    // re-aplica según último stream
+    const stream = video.srcObject;
+    if (stream) setMirrorFromStream(stream);
+    else setMirror(mirrorMode === "on");
+  });
 
-  window.addEventListener("resize", () => { makeWidgets(); });
+  $("dbgBtn").addEventListener("click", () => {
+    dbgEl.style.display = (dbgEl.style.display === "block") ? "none" : "block";
+    if (dbgEl.style.display === "block") {
+      const snap = Quantum.getStateSnapshot();
+      log(`Debug ON | norm=${snap.norm.toFixed(4)} | mirrorMode=${mirrorMode}`);
+    }
+  });
+
+  window.addEventListener("resize", () => { makeWidgets(); }, { passive:true });
+
+  // ------------------------
+  // Init
+  // ------------------------
+  resetQuantum();
+  makeWidgets();
+  requestAnimationFrame(step);
+
 })();
 </script>
 </body>
